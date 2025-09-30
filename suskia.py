@@ -1,29 +1,32 @@
 """Telegram bot implementation for running an Undercover style party game.
 
-The original project already contained most of the game rules, but the control
-flow mixed Telegram specific logic with game state in a way that made the bot
-hard to use.  This module restructures the code around the
-``python-telegram-bot`` conversation API so every action (player count, role
-distribution, card selection and elimination) is driven by a dedicated handler
-with clear transitions between the conversation states.
+The original reference bots bundled inside the project relied on the now
+deprecated ``Updater`` API from the ``python-telegram-bot`` library.  This
+module rebuilds the experience on top of the modern asynchronous
+``Application`` interface (v20+) while keeping the full game logic from the
+legacy implementation: configurable player names, role distribution, card
+selection, word assignment and round based scoring.
 """
 
 from __future__ import annotations
-from config import bot_token
 
 import logging
 import random
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from config import bot_token
+from telegram import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
     CommandHandler,
-    ConversationHandler,
     ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
 )
+from telegram.error import Forbidden, TelegramError
 
 # Enable logging so it is easier to debug when the bot is running live.
 logging.basicConfig(
@@ -32,37 +35,178 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
 # Conversation states
-SELECTING_PLAYERS, ROLES_SELECTION, SELECTING_CARDS, ELIMINATING = range(4)
-
+(
+    SELECTING_PLAYERS,
+    NAMING_PLAYERS,
+    ROLE_SELECTION,
+    CARD_SELECTION,
+    ELIMINATION,
+    WAITING_WHITE_GUESS,
+    ROUND_END,
+) = range(7)
 
 # Default role distributions for the supported number of players.
 ROLE_PRESETS: Dict[int, List[tuple[int, int, int]]] = {
     3: [(2, 1, 0), (2, 0, 1)],
     4: [(3, 1, 0), (2, 1, 1)],
-    5: [(3, 2, 0), (3, 1, 1)],
-    6: [(4, 1, 1), (3, 2, 1)],
-    7: [(4, 2, 1), (5, 1, 1)],
-    8: [(5, 2, 1), (4, 3, 1)],
-    9: [(6, 2, 1), (5, 3, 1)],
-    10: [(6, 3, 1), (5, 3, 2)],
+    5: [(3, 1, 1), (2, 2, 1)],
+    6: [(3, 2, 1), (2, 2, 2)],
+    7: [(4, 2, 1), (3, 2, 2)],
+    8: [(5, 2, 1), (4, 2, 2)],
+    9: [(5, 3, 1), (4, 3, 2)],
+    10: [(5, 3, 2), (4, 4, 2)],
 }
 
-
-ROLE_NAMES = {
-    "C": "Civilian",
-    "U": "Undercover",
-    "W": "Mr. White",
-}
-
-ROLE_POINTS = {"C": 1, "U": 2, "W": 4}
+ROLE_NAMES = {"C": "Civilian", "U": "Undercover", "W": "Mr. White"}
+ROLE_POINTS = {"C": 2, "U": 10, "W": 6}
 
 WORDS_LIBRARY = {
-    "C": ["APPLE", "MOUNTAIN", "SPACESHIP", "GUITAR"],
-    "U": ["ORANGE", "HILL", "ROCKET", "VIOLIN"],
-    "W": ["Invent your own word!"]
+    "C": [
+        "DOG",
+        "ICE CREAM",
+        "MEATBALLS",
+        "KUNG FU",
+        "CAMPING",
+        "COCA COLA",
+        "CAR",
+        "GUITAR",
+        "SUNRISE",
+        "RIVER",
+        "APPLE",
+        "TEA",
+        "FORK",
+        "CHAIR",
+        "PIZZA",
+        "LAPTOP",
+        "HAT",
+        "OWL",
+        "SNOW",
+        "LAKE",
+        "OCEAN",
+        "ROSE",
+        "SKATEBOARD",
+        "SOFA",
+        "TENNIS",
+        "COW",
+        "BOOK",
+        "BICYCLE",
+        "PEN",
+        "GLASSES",
+        "BANANA",
+        "BEACH",
+        "WINE",
+        "TRAIN",
+        "CINEMA",
+        "SANDALS",
+        "FISH",
+        "WINTER",
+        "GOLF",
+        "PARROT",
+        "VOLLEYBALL",
+        "TIGER",
+        "PAINTING",
+        "MOUNTAIN",
+        "JAZZ",
+        "FOREST",
+        "ROCK",
+        "CANDLE",
+        "KITE",
+        "CLOCK",
+        "CHOCOLATE",
+        "WHISKEY",
+        "ELEPHANT",
+        "NEWSPAPER",
+        "SPOON",
+        "RAINBOW",
+        "CAMERA",
+        "SAILBOAT",
+        "GARDEN",
+        "CAKE",
+        "MONKEY",
+        "SCISSORS",
+        "POOL",
+        "CELLPHONE",
+        "ZEBRA",
+        "RUGBY",
+        "PUMPKIN",
+        "COMPUTER",
+        "STOVE",
+    ],
+    "U": [
+        "WOLF",
+        "YOGHURT",
+        "CHICKEN NUGGETS",
+        "KARATE",
+        "PICNIC",
+        "FANTA",
+        "TRUCK",
+        "VIOLIN",
+        "SUNSET",
+        "STREAM",
+        "PEAR",
+        "COFFEE",
+        "SPOON",
+        "STOOL",
+        "BURGER",
+        "TABLET",
+        "CAP",
+        "EAGLE",
+        "RAIN",
+        "POND",
+        "SEA",
+        "TULIP",
+        "ROLLERBLADES",
+        "ARMCHAIR",
+        "BADMINTON",
+        "BULL",
+        "MAGAZINE",
+        "MOTORBIKE",
+        "PENCIL",
+        "SUNGLASSES",
+        "MANGO",
+        "LAKE",
+        "BEER",
+        "SUBWAY",
+        "THEATRE",
+        "FLIP FLOPS",
+        "SHARK",
+        "SUMMER",
+        "BASEBALL",
+        "CANARY",
+        "SOCCER",
+        "LEOPARD",
+        "SKETCH",
+        "HILL",
+        "BLUES",
+        "JUNGLE",
+        "PEBBLE",
+        "LANTERN",
+        "BALLOON",
+        "WATCH",
+        "CANDY",
+        "RUM",
+        "RHINO",
+        "BLOG",
+        "FORK",
+        "CLOUD",
+        "BINOCULARS",
+        "YACHT",
+        "PARK",
+        "PIE",
+        "APE",
+        "RAZOR",
+        "LAKE",
+        "SMARTPHONE",
+        "HORSE",
+        "FOOTBALL",
+        "SQUASH",
+        "LAPTOP",
+        "OVEN",
+    ],
 }
+
+WORD_PAIRS = list(zip(WORDS_LIBRARY["C"], WORDS_LIBRARY["U"]))
 
 
 @dataclass
@@ -70,11 +214,13 @@ class Player:
     """Stores the state for a single player in the session."""
 
     seat: int
+    name: str = ""
     role: str = ""
     word: str = ""
     eliminated: bool = False
     card: Optional[int] = None
     score: int = 0
+    telegram_id: Optional[int] = None
 
 
 @dataclass
@@ -86,56 +232,87 @@ class GameSession:
     pending_seats: List[int] = field(init=False)
     available_cards: List[int] = field(init=False)
     elimination_log: List[int] = field(default_factory=list)
+    role_distribution: Optional[tuple[int, int, int]] = None
+    word_pair: Optional[tuple[str, str]] = None
+    name_order: List[int] = field(init=False)
+    next_name_index: int = 0
+    name_prompt_message_id: Optional[int] = None
+    awaiting_guess_seat: Optional[int] = None
+    guess_prompt_message_id: Optional[int] = None
 
     def __post_init__(self) -> None:
-        self.players = {seat: Player(seat=seat) for seat in range(1, self.num_players + 1)}
+        self.players = {
+            seat: Player(seat=seat, name=f"Player {seat}")
+            for seat in range(1, self.num_players + 1)
+        }
         self.pending_seats = list(self.players.keys())
         self.available_cards = list(self.players.keys())
+        self.name_order = list(self.players.keys())
 
     # --- helpers for role assignment -------------------------------------------------
     def assign_roles(self, civilians: int, undercovers: int, mr_white: int) -> None:
+        self.role_distribution = (civilians, undercovers, mr_white)
+        self.elimination_log.clear()
+        self.pending_seats = list(self.players.keys())
+        self.available_cards = list(self.players.keys())
+        self.awaiting_guess_seat = None
+        self.guess_prompt_message_id = None
+
+        for player in self.players.values():
+            player.role = ""
+            player.word = ""
+            player.eliminated = False
+            player.card = None
+
         seats = list(self.players.keys())
         random.shuffle(seats)
-
         index = 0
+
+        if WORD_PAIRS:
+            self.word_pair = random.choice(WORD_PAIRS)
+        else:
+            self.word_pair = ("", "")
+        civilian_word, undercover_word = self.word_pair
+
         for _ in range(civilians):
             seat = seats[index]
             index += 1
             player = self.players[seat]
             player.role = "C"
-            player.word = random.choice(WORDS_LIBRARY["C"])
+            player.word = civilian_word
 
         for _ in range(undercovers):
             seat = seats[index]
             index += 1
             player = self.players[seat]
             player.role = "U"
-            player.word = random.choice(WORDS_LIBRARY["U"])
+            player.word = undercover_word
 
         for _ in range(mr_white):
             seat = seats[index]
             index += 1
             player = self.players[seat]
             player.role = "W"
-            player.word = random.choice(WORDS_LIBRARY["W"])
-
-        # Reset the card selection order whenever roles are reassigned.
-        self.pending_seats = list(self.players.keys())
-        self.available_cards = list(self.players.keys())
+            player.word = ""
 
     # --- helpers for card selection --------------------------------------------------
-    def register_card_choice(self, card_value: int) -> Player:
+    def register_card_choice(self, card_value: int, user_id: int) -> Player:
         seat = self.pending_seats.pop(0)
         player = self.players[seat]
         player.card = card_value
         self.available_cards.remove(card_value)
+        player.telegram_id = user_id
         return player
 
-    def elimination_queue(self) -> List[Player]:
-        return sorted(
-            self.players.values(),
-            key=lambda p: (p.card is None, p.card if p.card is not None else 0, p.seat),
-        )
+    def revert_card_choice(self, player: Player, previous_user: Optional[int]) -> None:
+        """Restore the last pending seat and card if a reveal could not be delivered."""
+
+        self.pending_seats.insert(0, player.seat)
+        if player.card is not None:
+            self.available_cards.append(player.card)
+            self.available_cards.sort()
+        player.card = None
+        player.telegram_id = previous_user
 
     # --- helpers for elimination -----------------------------------------------------
     def active_players(self) -> List[Player]:
@@ -158,15 +335,103 @@ class GameSession:
         civilians = self.civilians_remaining()
         if infiltrators == 0:
             return "civilians"
-        if civilians <= infiltrators:
+        if civilians <= 1:
             return "infiltrators"
         return None
+
+    # --- helpers for naming ----------------------------------------------------------
+    def current_name_seat(self) -> Optional[int]:
+        if self.next_name_index < len(self.name_order):
+            return self.name_order[self.next_name_index]
+        return None
+
+    def set_current_player_name(self, name: str) -> Optional[Player]:
+        seat = self.current_name_seat()
+        if seat is None:
+            return None
+        player = self.players[seat]
+        player.name = name
+        self.next_name_index += 1
+        return player
+
+    def skip_current_player_name(self) -> Optional[Player]:
+        seat = self.current_name_seat()
+        if seat is None:
+            return None
+        player = self.players[seat]
+        self.next_name_index += 1
+        return player
+
+    # --- helpers for scoring ---------------------------------------------------------
+    def apply_scores(self, outcome: str) -> None:
+        if outcome == "civilians":
+            for player in self.players.values():
+                if player.role == "C":
+                    player.score += ROLE_POINTS["C"]
+            return
+
+        if outcome == "mr_white":
+            for player in self.players.values():
+                if player.role == "W":
+                    player.score += ROLE_POINTS["W"]
+                elif player.role == "U":
+                    player.score += ROLE_POINTS["U"]
+            return
+
+        if outcome == "infiltrators":
+            for player in self.players.values():
+                if player.role == "U":
+                    player.score += ROLE_POINTS["U"]
+                elif player.role == "W":
+                    player.score += ROLE_POINTS["W"]
+
+    def standings(self) -> List[Player]:
+        return sorted(
+            self.players.values(),
+            key=lambda p: (-p.score, p.seat),
+        )
+
+    def scoreboard_lines(self) -> List[str]:
+        return [f"{player.name}: {player.score} point(s)" for player in self.standings()]
+
+    def reset_for_next_round(self) -> None:
+        if not self.role_distribution:
+            raise ValueError("Role distribution not set for this session")
+        civilians, undercovers, mr_white = self.role_distribution
+        self.assign_roles(civilians, undercovers, mr_white)
+
+
+def default_role_options(num_players: int) -> List[tuple[int, int, int]]:
+    if num_players in ROLE_PRESETS:
+        return ROLE_PRESETS[num_players]
+
+    options: List[tuple[int, int, int]] = []
+    base_infiltrators = max(1, num_players // 4)
+    alt_infiltrators = min(base_infiltrators + 1, num_players - 1)
+
+    civilians = num_players - base_infiltrators
+    options.append((civilians, base_infiltrators, 0))
+
+    if alt_infiltrators != base_infiltrators or alt_infiltrators == 1:
+        mr_white = 1 if alt_infiltrators >= 1 else 0
+        undercovers = max(0, alt_infiltrators - mr_white)
+        civilians_alt = num_players - undercovers - mr_white
+        if civilians_alt > 0:
+            options.append((civilians_alt, undercovers, mr_white))
+
+    seen = set()
+    unique_options = []
+    for option in options:
+        if option not in seen:
+            unique_options.append(option)
+            seen.add(option)
+    return unique_options
 
 
 def build_number_keyboard() -> InlineKeyboardMarkup:
     buttons: List[List[InlineKeyboardButton]] = []
     row: List[InlineKeyboardButton] = []
-    for number in range(3, 11):
+    for number in range(3, 21):
         row.append(InlineKeyboardButton(str(number), callback_data=f"players:{number}"))
         if len(row) == 4:
             buttons.append(row)
@@ -177,7 +442,7 @@ def build_number_keyboard() -> InlineKeyboardMarkup:
 
 
 def build_roles_keyboard(num_players: int) -> InlineKeyboardMarkup:
-    presets = ROLE_PRESETS.get(num_players, [])
+    presets = default_role_options(num_players)
     buttons = []
     for civilians, undercovers, mr_white in presets:
         label = f"{civilians} Civ, {undercovers} U, {mr_white} W"
@@ -201,15 +466,43 @@ def build_card_keyboard(session: GameSession) -> InlineKeyboardMarkup:
 
 def build_elimination_keyboard(session: GameSession) -> InlineKeyboardMarkup:
     buttons = [
-        [InlineKeyboardButton(f"Player {seat}", callback_data=f"eliminate:{seat}")]
-        for seat in sorted(player.seat for player in session.active_players())
+        [InlineKeyboardButton(player.name, callback_data=f"eliminate:{player.seat}")]
+        for player in sorted(session.active_players(), key=lambda p: p.seat)
     ]
     return InlineKeyboardMarkup(buttons)
 
 
+async def prompt_next_name(message: Message, session: GameSession) -> int:
+    seat = session.current_name_seat()
+    if seat is None:
+        session.name_prompt_message_id = None
+        await message.reply_text(
+            "All names registered! Choose the role distribution for this round:",
+        )
+        await message.reply_text(
+            "Select one of the distributions below:",
+            reply_markup=build_roles_keyboard(session.num_players),
+        )
+        return ROLE_SELECTION
+
+    player = session.players[seat]
+    prompt = await message.reply_text(
+        f"Reply to this message with the name for Player {seat} (current: {player.name}). Use /skip to keep it.",
+        reply_markup=ForceReply(
+            selective=False,
+            input_field_placeholder=f"Player {seat} name",
+        ),
+    )
+    session.name_prompt_message_id = prompt.message_id
+    return NAMING_PLAYERS
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.chat_data.pop("session", None)
-    logger.info("Starting new game in chat %s", update.effective_chat.id if update.effective_chat else "N/A")
+    logger.info(
+        "Starting new game in chat %s",
+        update.effective_chat.id if update.effective_chat else "N/A",
+    )
     if update.message:
         await update.message.reply_text(
             "How many players are taking part?",
@@ -230,24 +523,68 @@ async def select_players(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.edit_message_text("Could not determine the number of players. Try again with /start.")
         return ConversationHandler.END
 
-    if num_players not in ROLE_PRESETS:
-        await query.edit_message_text("Please choose a number between 3 and 10.")
+    if num_players < 3 or num_players > 20:
+        await query.edit_message_text("Please choose a number between 3 and 20.")
         return SELECTING_PLAYERS
 
     session = GameSession(num_players)
     context.chat_data["session"] = session
 
     await query.edit_message_text(
-        f"Game setup for {num_players} players. Choose how to distribute the roles:",
+        f"Game setup for {num_players} players. Let's set everyone's name.",
     )
-    await query.message.reply_text("Select one of the distributions below:", reply_markup=build_roles_keyboard(num_players))
-    return ROLES_SELECTION
+    return await prompt_next_name(query.message, session)
+
+
+async def capture_player_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    session: Optional[GameSession] = context.chat_data.get("session")
+    if not session:
+        await update.message.reply_text("Game session not found. Start a new game with /start.")
+        return ConversationHandler.END
+
+    chat = update.effective_chat
+    if chat and chat.type in {"group", "supergroup"}:
+        prompt_id = session.name_prompt_message_id
+        if not prompt_id:
+            await update.message.reply_text(
+                "Please wait for the next naming prompt before sending a name.",
+            )
+            return NAMING_PLAYERS
+
+        reply = update.message.reply_to_message
+        if not reply or reply.message_id != prompt_id:
+            await update.message.reply_text(
+                "Reply to the bot's latest prompt to register the next player's name.",
+            )
+            return NAMING_PLAYERS
+
+    name = update.message.text.strip()
+    if not name:
+        await update.message.reply_text("Please send a non-empty name or use /skip to keep the default.")
+        return NAMING_PLAYERS
+
+    player = session.set_current_player_name(name)
+    if player:
+        await update.message.reply_text(f"Seat {player.seat} will play as {player.name}.")
+    return await prompt_next_name(update.message, session)
+
+
+async def skip_player_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    session: Optional[GameSession] = context.chat_data.get("session")
+    if not session:
+        await update.message.reply_text("Game session not found. Start a new game with /start.")
+        return ConversationHandler.END
+
+    player = session.skip_current_player_name()
+    if player:
+        await update.message.reply_text(f"Keeping default name {player.name} for seat {player.seat}.")
+    return await prompt_next_name(update.message, session)
 
 
 async def select_roles(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     if not query:
-        return ROLES_SELECTION
+        return ROLE_SELECTION
     await query.answer()
 
     session: Optional[GameSession] = context.chat_data.get("session")
@@ -262,11 +599,15 @@ async def select_roles(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         mr_white = int(mr_white)
     except (ValueError, IndexError):
         await query.edit_message_text("Invalid role selection. Please pick a preset from the keyboard.")
-        return ROLES_SELECTION
+        return ROLE_SELECTION
 
     if civilians + undercovers + mr_white != session.num_players:
         await query.edit_message_text("The distribution does not match the number of players.")
-        return ROLES_SELECTION
+        return ROLE_SELECTION
+
+    if undercovers == 0 and mr_white == 0:
+        await query.edit_message_text("At least one Undercover or Mr. White is required to play.")
+        return ROLE_SELECTION
 
     session.assign_roles(civilians, undercovers, mr_white)
 
@@ -274,17 +615,19 @@ async def select_roles(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         f"Roles assigned! {civilians} Civilians, {undercovers} Undercover(s) and {mr_white} Mr. White.",
     )
 
+    next_seat = session.pending_seats[0]
+    next_player = session.players[next_seat]
     await query.message.reply_text(
-        f"Player {session.pending_seats[0]}, please choose a card to determine the turn order.",
+        f"{next_player.name}, please choose a card to determine the order.",
         reply_markup=build_card_keyboard(session),
     )
-    return SELECTING_CARDS
+    return CARD_SELECTION
 
 
 async def select_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     if not query:
-        return SELECTING_CARDS
+        return CARD_SELECTION
     await query.answer()
 
     session: Optional[GameSession] = context.chat_data.get("session")
@@ -292,44 +635,100 @@ async def select_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         await query.edit_message_text("Game session not found. Start a new game with /start.")
         return ConversationHandler.END
 
+    if not session.pending_seats:
+        await query.answer("All cards have already been drawn.", show_alert=True)
+        return CARD_SELECTION
+
     try:
         card_value = int(query.data.split(":", 1)[1])
     except (ValueError, IndexError):
         await query.edit_message_text("That card could not be processed. Try again.")
-        return SELECTING_CARDS
+        return CARD_SELECTION
 
     if card_value not in session.available_cards:
         await query.answer("Card already taken. Pick another one.", show_alert=True)
-        return SELECTING_CARDS
+        return CARD_SELECTION
 
-    player = session.register_card_choice(card_value)
-    await query.edit_message_text(f"Player {player.seat} chose card {card_value}.")
+    seat = session.pending_seats[0]
+    player = session.players[seat]
+
+    user_id = query.from_user.id
+    if player.telegram_id and player.telegram_id != user_id:
+        await query.answer(
+            f"It's {player.name}'s turn to draw. Ask them to pick their card.",
+            show_alert=True,
+        )
+        return CARD_SELECTION
+
+    previous_user = player.telegram_id
+    player = session.register_card_choice(card_value, user_id)
+
+    proposed_name = player.name
+    if player.name.startswith("Player "):
+        proposed_name = query.from_user.full_name or player.name
+
+    if player.role == "W":
+        dm_lines = [
+            f"Hi {query.from_user.first_name or proposed_name}!",
+            "You are Mr. White this round.",
+            "You received no secret word—listen carefully and improvise!",
+        ]
+    else:
+        dm_lines = [
+            f"Hi {query.from_user.first_name or proposed_name}!",
+            f"Your secret word is: {player.word}",
+            "Keep it to yourself and describe it carefully during the discussion.",
+        ]
+
+    try:
+        await context.bot.send_message(chat_id=user_id, text="\n".join(dm_lines))
+    except Forbidden:
+        session.revert_card_choice(player, previous_user)
+        await query.answer(
+            "I couldn't send you the word. Start a private chat with me and tap the card again.",
+            show_alert=True,
+        )
+        return CARD_SELECTION
+    except TelegramError as exc:
+        session.revert_card_choice(player, previous_user)
+        logger.exception("Failed to send secret word to user %s", user_id, exc_info=exc)
+        await query.answer(
+            "Something went wrong while sending your word. Please try again.",
+            show_alert=True,
+        )
+        return CARD_SELECTION
+
+    player.name = proposed_name
+
+    await query.edit_message_text(
+        f"{player.name} drew card {card_value}. Check your private messages!",
+    )
 
     if session.pending_seats:
-        next_player = session.pending_seats[0]
+        next_seat = session.pending_seats[0]
+        next_player = session.players[next_seat]
         await query.message.reply_text(
-            f"Player {next_player}, choose your card:",
+            f"{next_player.name}, choose your card:",
             reply_markup=build_card_keyboard(session),
         )
-        return SELECTING_CARDS
+        return CARD_SELECTION
 
-    order = session.elimination_queue()
     order_text = ", ".join(
-        f"Player {p.seat} (card {p.card})" if p.card is not None else f"Player {p.seat}"
-        for p in order
+        f"{session.players[seat].name} (card {session.players[seat].card})"
+        for seat in sorted(session.players.keys(), key=lambda s: session.players[s].card or 0)
     )
-    await query.message.reply_text(f"Elimination order based on cards: {order_text}")
+    await query.message.reply_text(f"Speaking order based on cards: {order_text}")
     await query.message.reply_text(
-        "Select a player to eliminate:",
+        "Discussion phase: talk it through and then pick someone to eliminate.",
         reply_markup=build_elimination_keyboard(session),
     )
-    return ELIMINATING
+    return ELIMINATION
 
 
 async def handle_elimination(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     if not query:
-        return ELIMINATING
+        return ELIMINATION
     await query.answer()
 
     session: Optional[GameSession] = context.chat_data.get("session")
@@ -341,71 +740,200 @@ async def handle_elimination(update: Update, context: ContextTypes.DEFAULT_TYPE)
         seat = int(query.data.split(":", 1)[1])
     except (ValueError, IndexError):
         await query.edit_message_text("Invalid selection. Try again.")
-        return ELIMINATING
+        return ELIMINATION
 
     player = session.players.get(seat)
     if not player or player.eliminated:
         await query.answer("That player is already out.", show_alert=True)
-        return ELIMINATING
+        return ELIMINATION
 
     session.eliminate(seat)
     await query.edit_message_text(
-        f"Player {seat} has been eliminated and was {ROLE_NAMES.get(player.role, 'Unknown')}!"
+        f"{player.name} has been eliminated and was {ROLE_NAMES.get(player.role, 'Unknown')}!",
     )
+
+    if player.role == "W" and session.word_pair:
+        session.awaiting_guess_seat = seat
+        prompt = await query.message.reply_text(
+            (
+                f"{player.name}, you have one chance to guess the civilians' word. "
+                "Reply to this message with your guess to win instantly!"
+            ),
+            reply_markup=ForceReply(
+                selective=False,
+                input_field_placeholder="Type Mr. White's guess",
+            ),
+        )
+        session.guess_prompt_message_id = prompt.message_id
+        return WAITING_WHITE_GUESS
 
     outcome = session.outcome()
     if outcome:
-        await announce_winner(query, session, outcome)
-        context.chat_data.pop("session", None)
-        return ConversationHandler.END
+        return await conclude_round(query.message, session, outcome)
 
     await query.message.reply_text(
-        "Select the next player to eliminate:",
+        "Discussion phase continues. Choose the next player to eliminate:",
         reply_markup=build_elimination_keyboard(session),
     )
-    return ELIMINATING
+    return ELIMINATION
 
 
-async def announce_winner(query, session: GameSession, outcome: str) -> None:
-    message = query.message
+async def handle_mr_white_guess(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    session: Optional[GameSession] = context.chat_data.get("session")
+    if not session or session.awaiting_guess_seat is None:
+        if update.message:
+            await update.message.reply_text(
+                "There is no active Mr. White guess right now."
+            )
+        return ELIMINATION if session else ConversationHandler.END
+
+    prompt_id = session.guess_prompt_message_id
+    if prompt_id:
+        reply = update.message.reply_to_message if update.message else None
+        if not reply or reply.message_id != prompt_id:
+            if update.message:
+                await update.message.reply_text(
+                    "Reply to the latest guess prompt to submit your answer."
+                )
+            return WAITING_WHITE_GUESS
+
+    player = session.players[session.awaiting_guess_seat]
+    expected_user_id = player.telegram_id
+    if expected_user_id and update.effective_user and update.effective_user.id != expected_user_id:
+        if update.message:
+            await update.message.reply_text("Only Mr. White can answer this prompt.")
+        return WAITING_WHITE_GUESS
+
+    guess = (update.message.text if update.message else "").strip()
+    if not guess:
+        if update.message:
+            await update.message.reply_text("Send a guess for the civilian word to continue.")
+        return WAITING_WHITE_GUESS
+
+    session.awaiting_guess_seat = None
+    session.guess_prompt_message_id = None
+
+    civilian_word = session.word_pair[0] if session.word_pair else ""
+    if civilian_word and guess.casefold() == civilian_word.casefold():
+        await update.message.reply_text(
+            f"Mr. White guessed '{civilian_word}' correctly!"
+        )
+        return await conclude_round(update.message, session, "mr_white")
+
+    await update.message.reply_text("That's not the word. The game continues.")
+
+    outcome = session.outcome()
+    if outcome:
+        return await conclude_round(update.message, session, outcome)
+
+    await update.message.reply_text(
+        "Discussion phase continues. Choose the next player to eliminate:",
+        reply_markup=build_elimination_keyboard(session),
+    )
+    return ELIMINATION
+
+
+async def conclude_round(message: Message, session: GameSession, outcome: str) -> int:
     if outcome == "civilians":
         await message.reply_text("All infiltrators have been eliminated. Civilians win this round!")
+    elif outcome == "mr_white":
+        await message.reply_text(
+            "Mr. White correctly guessed the civilian word and wins the game!"
+        )
     else:
-        await message.reply_text("Infiltrators now outnumber civilians. Undercover team wins!")
-
-    scoreboard_lines = []
-    for seat in sorted(session.players):
-        player = session.players[seat]
-        player.score = ROLE_POINTS.get(player.role, 0)
-        scoreboard_lines.append(
-            f"Player {seat}: {ROLE_NAMES.get(player.role, 'Unknown')} - {player.score} point(s)."
+        await message.reply_text(
+            "Only one civilian remains. The Undercover team wins this round!"
         )
 
-    await message.reply_text("Final roles:\n" + "\n".join(scoreboard_lines))
-    await message.reply_text("Game over! Use /start to play again or /end to stop the bot.")
+    session.apply_scores(outcome)
+    scoreboard = session.scoreboard_lines()
+    await message.reply_text("Current standings:\n" + "\n".join(scoreboard))
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Next round", callback_data="round:continue")],
+            [InlineKeyboardButton("End game", callback_data="round:end")],
+        ]
+    )
+    await message.reply_text(
+        "Do you want to play another round with the same players?",
+        reply_markup=keyboard,
+    )
+    return ROUND_END
+
+
+async def handle_round_end(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query:
+        return ROUND_END
+    await query.answer()
+
+    session: Optional[GameSession] = context.chat_data.get("session")
+    if not session:
+        await query.edit_message_text("Game session not found. Start a new game with /start.")
+        return ConversationHandler.END
+
+    _, action = query.data.split(":", 1)
+    if action == "continue":
+        session.reset_for_next_round()
+        await query.edit_message_text("Starting the next round!")
+        if session.role_distribution:
+            civ, und, white = session.role_distribution
+            await query.message.reply_text(
+                f"Roles reassigned! {civ} Civilians, {und} Undercover(s), {white} Mr. White.",
+            )
+        next_seat = session.pending_seats[0]
+        next_player = session.players[next_seat]
+        await query.message.reply_text(
+            f"{next_player.name}, please choose a card to determine the order.",
+            reply_markup=build_card_keyboard(session),
+        )
+        return CARD_SELECTION
+
+    await query.edit_message_text("Game over! Thanks for playing.")
+    scoreboard = session.scoreboard_lines()
+    if scoreboard:
+        await query.message.reply_text("Final standings:\n" + "\n".join(scoreboard))
+    context.chat_data.pop("session", None)
+    await query.message.reply_text("Use /start to begin a new game at any time.")
+    return ConversationHandler.END
 
 
 async def cancel_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.chat_data.pop("session", None)
+    session = context.chat_data.pop("session", None)
     if update.callback_query:
         await update.callback_query.answer()
         await update.callback_query.edit_message_text("Game cancelled.")
     elif update.message:
         await update.message.reply_text("Game cancelled.")
+
+    if session:
+        scoreboard = session.scoreboard_lines()
+        if scoreboard and update.effective_message:
+            await update.effective_message.reply_text(
+                "Standings before cancellation:\n" + "\n".join(scoreboard)
+            )
     return ConversationHandler.END
 
 
-def main(bot_token) -> None:
-
+def main(bot_token: str) -> None:
     application = ApplicationBuilder().token(bot_token).build()
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
             SELECTING_PLAYERS: [CallbackQueryHandler(select_players, pattern=r"^players:")],
-            ROLES_SELECTION: [CallbackQueryHandler(select_roles, pattern=r"^roles:")],
-            SELECTING_CARDS: [CallbackQueryHandler(select_card, pattern=r"^card:")],
-            ELIMINATING: [CallbackQueryHandler(handle_elimination, pattern=r"^eliminate:")],
+            NAMING_PLAYERS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, capture_player_name),
+                CommandHandler("skip", skip_player_name),
+            ],
+            ROLE_SELECTION: [CallbackQueryHandler(select_roles, pattern=r"^roles:")],
+            CARD_SELECTION: [CallbackQueryHandler(select_card, pattern=r"^card:")],
+            ELIMINATION: [CallbackQueryHandler(handle_elimination, pattern=r"^eliminate:")],
+            WAITING_WHITE_GUESS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_mr_white_guess)
+            ],
+            ROUND_END: [CallbackQueryHandler(handle_round_end, pattern=r"^round:")],
         },
         fallbacks=[CommandHandler("end", cancel_game), CommandHandler("cancel", cancel_game)],
         per_chat=True,
